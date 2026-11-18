@@ -30,13 +30,14 @@ class Vehicle:
     def remaining_capacity_kwh(self):
         return max(0.0,self.battery_capacity_kwh - self.current_charge_kwh)
 class Billing_Engine:
-    PEAK_RATE = 0.35
-    OFF_PEAK_RATE = 0.15
+    PEAK_RATE = 0.55
+    OFF_PEAK_RATE = 0.30
     OFF_PEAK_END_HOUR = 6
     OFF_PEAK_START_HOUR = 22
     VIP_DISCOUNT = 0.8
     IDLE_FEE_RATE = 0.5 # dollars per minute after grace period
     GRACE_PERIOD_SECONDS = 900 # 15 minutes
+    FAST_CHARGE_MULTIPLIER = 1.5
     @classmethod
     def get_electricity_rate(cls,time_stamp):
         seconds_in_day = time_stamp % 86400
@@ -63,11 +64,15 @@ class Billing_Engine:
         t = start
         while t <end:
             seg_end= min(end, cls.next_rate_boundary(t))
-                
             cost += power_kw * (((seg_end - t)/3600) * cls.get_electricity_rate(t))
             t = seg_end
         return cost
-
+    @classmethod
+    def calculate_charging_cost(cls, start,end,power_kw,port_type):
+        cost = cls.calculate_interval_cost(start,end,power_kw)
+        if port_type == "FAST":
+            cost *= cls.FAST_CHARGE_MULTIPLIER
+        return cost
             
 
 
@@ -212,14 +217,14 @@ class ChargingStationManager:
             if remaining <= port.power * (dt/3600):
                 charge_end = self.last_timestamp + (remaining/port.power) * 3600
                 vehicle.total_energy_delivered += remaining
-                vehicle.total_energy_cost += Billing_Engine.calculate_interval_cost(self.last_timestamp, charge_end,port.power)
+                vehicle.total_energy_cost += Billing_Engine.calculate_charging_cost(self.last_timestamp, charge_end, port.power, port.port_type)
                 vehicle.current_charge_kwh += remaining
                 vehicle.completed_timestamp = charge_end
                 log.append(f"CHARGING_COMPLETE:{vehicle.vehicle_id}") 
             else:
                 energy = dt/3600 * port.power
                 vehicle.total_energy_delivered += energy
-                vehicle.total_energy_cost += Billing_Engine.calculate_interval_cost(self.last_timestamp,timestamp,port.power)
+                vehicle.total_energy_cost += Billing_Engine.calculate_charging_cost(self.last_timestamp, timestamp, port.power, port.port_type)
                 vehicle.current_charge_kwh += energy
         old_states = {pid:p.state for pid,p in self.ports.items()}
         self.rebalance_load()
@@ -230,13 +235,15 @@ class ChargingStationManager:
         return log
             
         
-m = ChargingStationManager(100)
-m.add_port("P1", "FAST")
-m.tick(0)
-m.plug_in(0, "P1", "V1", 60, 0, 50, "REGULAR")
+if __name__ == "__main__":
+    m = ChargingStationManager(total_grid_capacity_kw=100)
+    m.add_port("P1", "FAST")
+    m.tick(0)
 
-print(m.tick(3600))
-print(m.vehicles["V1"].current_charge_kwh)
-print(m.tick(7200))
-print(m.vehicles["V1"].completed_timestamp) 
+    m.plug_in(0, "P1", "V1", battery_cap_kwh=60, current_kwh=0, max_rate_kw=50, user_tier="REGULAR")
+    print(m.tick(7200))
+    # ['CHARGING_COMPLETE:V1', 'STATE_CHANGE:P1=WAITING']
+
+    print(m.unplug(9000, "P1"))
+    # VEHICLE:V1|ENERGY:60.00|COST:27.00|IDLE_FEE:31.50
         

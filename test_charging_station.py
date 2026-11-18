@@ -110,13 +110,15 @@ def test_next_rate_boundary(t, expected):
 def test_interval_cost_splits_at_22():
     # 10 kW from 21:30 to 24:00: 0.5h peak + 2h off-peak
     cost = Billing_Engine.calculate_interval_cost(21.5 * HOUR, 24 * HOUR, 10)
-    assert cost == pytest.approx(10 * 0.5 * 0.35 + 10 * 2 * 0.15)  # 4.75
+    assert cost == pytest.approx(
+        10 * 0.5 * Billing_Engine.PEAK_RATE + 10 * 2 * Billing_Engine.OFF_PEAK_RATE
+    )
 
 
 def test_interval_cost_spanning_a_full_day():
     # 1 kW for 24h: 16h peak + 8h off-peak
     cost = Billing_Engine.calculate_interval_cost(0, 24 * HOUR, 1)
-    assert cost == pytest.approx(16 * 0.35 + 8 * 0.15)
+    assert cost == pytest.approx(16 * Billing_Engine.PEAK_RATE + 8 * Billing_Engine.OFF_PEAK_RATE)
 
 
 # ---------- billing: idle fee ----------
@@ -201,3 +203,17 @@ def test_failed_plug_in_leaves_station_unchanged():
     with pytest.raises(ValueError):
         m.plug_in(10, "P1", "V2", 60, 0, 50, "REGULAR")  # port occupied
     assert "V2" not in m.vehicles
+
+
+def test_fast_charging_costs_more_than_standard():
+    fast = Billing_Engine.calculate_charging_cost(0, HOUR, 7.2, "FAST")
+    standard = Billing_Engine.calculate_charging_cost(0, HOUR, 7.2, "STANDARD")
+    assert fast == pytest.approx(standard * Billing_Engine.FAST_CHARGE_MULTIPLIER)
+
+
+def test_vip_discount_applied_to_bill():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 0, 50, "VIP")
+    bill = m.unplug(HOUR, "P1")  # 50 kWh, all off-peak, fast port
+    expected = 50 * Billing_Engine.OFF_PEAK_RATE * Billing_Engine.FAST_CHARGE_MULTIPLIER * Billing_Engine.VIP_DISCOUNT
+    assert f"COST:{expected:.2f}" in bill
