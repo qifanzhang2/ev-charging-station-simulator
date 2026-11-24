@@ -3,7 +3,9 @@ import pytest
 from EV_ChargingStation_Simulation_System import (
     Billing_Engine,
     ChargingStationManager,
+    ProportionalSharePolicy,
     Vehicle,
+    WeightedProportionalPolicy,
 )
 
 HOUR = 3600
@@ -168,7 +170,7 @@ def test_tick_then_unplug_does_not_double_bill():
 
 
 def test_empty_weights_means_equal_priority():
-    m = ChargingStationManager(100, tier_weights={})
+    m = ChargingStationManager(100, policy=WeightedProportionalPolicy({}))
     for pid in ("P1", "P2", "P3"):
         m.add_port(pid, "FAST")
     m.tick(0)
@@ -217,3 +219,100 @@ def test_vip_discount_applied_to_bill():
     bill = m.unplug(HOUR, "P1")  # 50 kWh, all off-peak, fast port
     expected = 50 * Billing_Engine.OFF_PEAK_RATE * Billing_Engine.FAST_CHARGE_MULTIPLIER * Billing_Engine.VIP_DISCOUNT
     assert f"COST:{expected:.2f}" in bill
+
+
+# ---------- demand-based charging ----------
+
+def test_vehicle_stops_when_demand_is_met():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 20, 50, "REGULAR", energy_requested_kwh=25)
+    logs = m.tick(HOUR)
+    v = m.vehicles["V1"]
+    assert "CHARGING_COMPLETE:V1" in logs
+    assert v.total_energy_delivered == pytest.approx(25.0)
+    assert v.current_charge_kwh == pytest.approx(45.0)
+    assert v.completed_timestamp == pytest.approx(0.5 * HOUR)
+
+
+def test_target_soc_converts_to_energy_request():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 20, 50, "REGULAR", target_soc=0.8)
+    assert m.vehicles["V1"].energy_requested_kwh == pytest.approx(28.0)
+
+
+def test_already_above_target_soc_completes_immediately():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 51, 50, "REGULAR", target_soc=0.8)
+    assert m.vehicles["V1"].is_demand_met()
+    assert m.ports["P1"].power == 0.0
+
+
+def test_vehicle_starting_partially_charged_does_not_overcharge():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 20, 50, "REGULAR")
+    m.tick(2 * HOUR)
+    assert m.vehicles["V1"].current_charge_kwh == pytest.approx(60.0)
+
+
+def test_departure_must_be_after_plug_in():
+    m = make_station(100, n_ports=1)
+    with pytest.raises(ValueError):
+        m.plug_in(100, "P1", "V1", 60, 20, 50, "REGULAR", departure_time=100)
+
+
+def test_idle_fee_starts_at_plug_in_if_already_satisfied():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 51, 50, "REGULAR", target_soc=0.8)
+    bill = m.unplug(HOUR, "P1")
+    # idle from t=0: (3600 - 900) s = 45 min x $0.50
+    assert f"IDLE_FEE:{45 * Billing_Engine.IDLE_FEE_RATE:.2f}" in bill
+
+
+# ---------- allocation policies (unit tests, no manager needed) ----------
+
+class _V:
+    def __init__(self, tier):
+        self.user_tier = tier
+
+
+def test_proportional_share_when_grid_is_short():
+    requests = [("P1", _V("REGULAR"), 50), ("P2", _V("REGULAR"), 25)]
+    result = ProportionalSharePolicy().allocate(requests, 60)
+    assert result["P1"] == pytest.approx(40)
+    assert result["P2"] == pytest.approx(20)
+
+
+def test_proportional_share_when_grid_is_sufficient():
+    requests = [("P1", _V("REGULAR"), 20), ("P2", _V("REGULAR"), 20)]
+    assert ProportionalSharePolicy().allocate(requests, 100) == {"P1": 20, "P2": 20}
+
+
+def test_policies_handle_no_requests():
+    assert ProportionalSharePolicy().allocate([], 100) == {}
+    assert WeightedProportionalPolicy().allocate([], 100) == {}
+
+
+def test_weighted_share_is_capped_at_max_kw():
+    policy = WeightedProportionalPolicy({"VIP": 10, "REGULAR": 1})
+    requests = [("P1", _V("VIP"), 7.2), ("P2", _V("REGULAR"), 50)]
+    result = policy.allocate(requests, 40)
+    assert result["P1"] == pytest.approx(7.2)  # uncapped share would be ~23.6 kW
+
+
+def test_manager_accepts_custom_policy():
+    m = ChargingStationManager(90, policy=ProportionalSharePolicy())
+    for pid in ("P1", "P2", "P3"):
+        m.add_port(pid, "FAST")
+    m.tick(0)
+    m.plug_in(0, "P1", "V1", 60, 0, 50, "VIP")
+    m.plug_in(0, "P2", "V2", 60, 0, 50, "REGULAR")
+    m.plug_in(0, "P3", "V3", 60, 0, 50, "REGULAR")
+    for pid in ("P1", "P2", "P3"):
+        assert m.ports[pid].power == pytest.approx(30)  # VIP gets no advantage
+
+
+def test_satisfied_vehicle_enters_idling_state():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 60, 0, 50, "REGULAR", energy_requested_kwh=10)
+    logs = m.tick(HOUR)
+    assert "STATE_CHANGE:P1=IDLING" in logs
