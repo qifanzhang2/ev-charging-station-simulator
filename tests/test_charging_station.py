@@ -1,8 +1,10 @@
 import pytest
 
-from EV_ChargingStation_Simulation_System import (
+from ev_sim import (
     Billing_Engine,
     ChargingStationManager,
+    EDFPolicy,
+    LLFPolicy,
     ProportionalSharePolicy,
     Vehicle,
     WeightedProportionalPolicy,
@@ -316,3 +318,86 @@ def test_satisfied_vehicle_enters_idling_state():
     m.plug_in(0, "P1", "V1", 60, 0, 50, "REGULAR", energy_requested_kwh=10)
     logs = m.tick(HOUR)
     assert "STATE_CHANGE:P1=IDLING" in logs
+
+
+# ---------- priority-based greedy policies (EDF, LLF) ----------
+
+def make_vehicle(vid, departure=None, request=None, current=0, tier="REGULAR"):
+    return Vehicle(vid, 100, current, 50, tier, departure_time=departure, energy_requested_kwh=request)
+
+
+def test_edf_serves_earliest_departure_first():
+    a = make_vehicle("A", departure=3 * HOUR)
+    b = make_vehicle("B", departure=5 * HOUR)
+    requests = [("P1", b, 50), ("P2", a, 50)]
+    result = EDFPolicy().allocate(requests, 70, now=0)
+    assert result["P2"] == pytest.approx(50)   # A leaves first, gets full power
+    assert result["P1"] == pytest.approx(20)   # B gets the leftover
+
+
+def test_edf_puts_vehicles_without_departure_last():
+    a = make_vehicle("A")                      # no departure time
+    b = make_vehicle("B", departure=5 * HOUR)
+    requests = [("P1", a, 50), ("P2", b, 50)]
+    result = EDFPolicy().allocate(requests, 50, now=0)
+    assert result["P2"] == pytest.approx(50)
+    assert result.get("P1", 0.0) == 0.0
+
+
+def test_greedy_never_exceeds_capacity():
+    vehicles = [make_vehicle(f"V{i}", departure=(i + 1) * HOUR) for i in range(4)]
+    requests = [(f"P{i}", v, 50) for i, v in enumerate(vehicles)]
+    result = EDFPolicy().allocate(requests, 120, now=0)
+    assert sum(result.values()) == pytest.approx(120)
+    assert all(p <= 50 + 1e-9 for p in result.values())
+
+
+def test_greedy_ties_broken_by_port_id():
+    a = make_vehicle("A", departure=3 * HOUR)
+    b = make_vehicle("B", departure=3 * HOUR)
+    requests = [("P2", a, 50), ("P1", b, 50)]
+    result = EDFPolicy().allocate(requests, 50, now=0)
+    assert result == {"P1": 50}               # same deadline -> lower port_id wins
+
+
+def test_llf_differs_from_edf():
+    # A: leaves in 2h, needs 10 kWh -> laxity 1.8h
+    # B: leaves in 3h, needs 100 kWh -> laxity 1.0h
+    a = make_vehicle("A", departure=2 * HOUR, request=10)
+    b = make_vehicle("B", departure=3 * HOUR, request=100)
+    requests = [("P1", a, 50), ("P2", b, 50)]
+    assert EDFPolicy().allocate(requests, 50, now=0) == {"P1": 50}
+    assert LLFPolicy().allocate(requests, 50, now=0) == {"P2": 50}
+
+
+def test_llf_uses_remaining_demand_not_battery_space():
+    # Battery has 80 kWh of space but the driver only wants 10 kWh
+    small = make_vehicle("A", departure=2 * HOUR, request=10, current=20)
+    big = make_vehicle("B", departure=3 * HOUR, request=60, current=20)
+    policy = LLFPolicy()
+    assert policy.priority(small, 50, now=0) == pytest.approx(2 * HOUR - 10 / 50 * HOUR)
+    assert policy.priority(big, 50, now=0) == pytest.approx(3 * HOUR - 60 / 50 * HOUR)
+
+
+def test_llf_laxity_shrinks_over_time():
+    v = make_vehicle("A", departure=4 * HOUR, request=50)
+    policy = LLFPolicy()
+    assert policy.priority(v, 50, now=HOUR) < policy.priority(v, 50, now=0)
+
+
+def test_llf_requires_current_time():
+    v = make_vehicle("A", departure=4 * HOUR, request=50)
+    with pytest.raises(ValueError):
+        LLFPolicy().allocate([("P1", v, 50)], 50, now=None)
+
+
+def test_manager_runs_with_llf_policy():
+    m = ChargingStationManager(50, policy=LLFPolicy())
+    m.add_port("P1", "FAST")
+    m.add_port("P2", "FAST")
+    m.tick(0)
+    m.plug_in(0, "P1", "A", 100, 0, 50, "REGULAR", departure_time=2 * HOUR, energy_requested_kwh=10)
+    m.plug_in(0, "P2", "B", 100, 0, 50, "REGULAR", departure_time=3 * HOUR, energy_requested_kwh=100)
+    assert m.ports["P2"].power == pytest.approx(50)   # B is more urgent
+    assert m.ports["P1"].power == pytest.approx(0)
+    assert m.ports["P1"].state == "WAITING"
