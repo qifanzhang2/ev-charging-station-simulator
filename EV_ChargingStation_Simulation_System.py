@@ -14,7 +14,7 @@ class Port:
             raise ValueError(f"Port_id:{self.port_id} has invalid port_type")
 
 class Vehicle:
-    def __init__(self,vehicle_id,battery_capacity_kwh,current_charge_kwh,max_accept_rate_kw,user_tier):
+    def __init__(self,vehicle_id,battery_capacity_kwh,current_charge_kwh,max_accept_rate_kw,user_tier,departure_time = None,energy_requested_kwh = None):
         self.vehicle_id = vehicle_id
         self.battery_capacity_kwh = battery_capacity_kwh
         self.current_charge_kwh = current_charge_kwh
@@ -24,11 +24,18 @@ class Vehicle:
         self.completed_timestamp = None
         self.total_energy_cost = 0
         self.port_id = None
+        self.departure_time = departure_time
+        self.energy_requested_kwh = energy_requested_kwh
 
-    def is_fully_charged(self):
-        return self.current_charge_kwh >= self.battery_capacity_kwh - 1e-9
     def remaining_capacity_kwh(self):
         return max(0.0,self.battery_capacity_kwh - self.current_charge_kwh)
+    def remaining_demand_kwh(self):
+        if self.energy_requested_kwh is not None:
+            return max(0.0,min(self.energy_requested_kwh - self.total_energy_delivered,self.remaining_capacity_kwh()))
+        else:
+            return self.remaining_capacity_kwh()
+    def is_demand_met(self):
+        return self.remaining_demand_kwh() <= 1e-9
 class Billing_Engine:
     PEAK_RATE = 0.55
     OFF_PEAK_RATE = 0.30
@@ -87,46 +94,82 @@ class Billing_Engine:
         raw_energy_cost = vehicle.total_energy_cost * cls.VIP_DISCOUNT if vehicle.user_tier == "VIP" else vehicle.total_energy_cost
         return raw_energy_cost
 
+class AllocationPolicy:
+    def allocate(self, requests, capacity_kw,now = None):
+        raise NotImplementedError
+class ProportionalSharePolicy(AllocationPolicy):
+    def allocate(self,requests,capacity_kw,now = None):
+        total_power_demanded = sum([max_kw for _,_,max_kw in requests])
+        if total_power_demanded ==0:
+            return {}
+        if total_power_demanded <= capacity_kw:
+            return {port_id: max_kw for port_id,_,max_kw in requests}
+        rebalanced_power = {}
+        for port_id,_,max_kw in requests:
+            rebalanced_power[port_id] = (max_kw / total_power_demanded) * capacity_kw
+        return rebalanced_power
+class WeightedProportionalPolicy(AllocationPolicy):
+    DEFAULT_WEIGHTS = {"VIP": 2, "REGULAR":1}
+    def __init__(self,tier_weights = None):
+        self.tier_weights = dict(tier_weights) if tier_weights is not None else dict(self.DEFAULT_WEIGHTS)
+    def allocate(self,requests,capacity_kw,now = None):
+        total_power_demanded = sum([max_kw for _,_,max_kw in requests])
+        total_weighted_power_demanded = 0.0
+        for _,vehicle,max_kw in requests:
+            total_weighted_power_demanded += max_kw * self.tier_weights.get(vehicle.user_tier,1.0)
+        if total_power_demanded <= capacity_kw:
+            return {port_id:max_kw for port_id,_,max_kw in requests}
+        rebalanced_power = {}
+        for port_id,vehicle,max_kw in requests:
+            share = (self.tier_weights.get(vehicle.user_tier,1.0) * max_kw)/total_weighted_power_demanded
+            rebalanced_power[port_id] = min(max_kw,capacity_kw * share)
+        return rebalanced_power
+
+
+
+            
+
+
+
+        
+            
+                        
+
+
 
 
 class ChargingStationManager:
-    DEFAULT_WEIGHTS = {"VIP": 2, "REGULAR":1}
-    def __init__(self, total_grid_capacity_kw: float,tier_weights = None):
+    def __init__(self, total_grid_capacity_kw: float,policy = None):
         self.total_grid_cap = total_grid_capacity_kw
         self.ports = {}
         self.vehicles = {}
         self.last_timestamp = None
-        self.tier_weights = dict(tier_weights) if tier_weights is not None else dict(self.DEFAULT_WEIGHTS)
+        self.policy = policy if policy is not None else WeightedProportionalPolicy()
+        
         
 
 
     def add_port(self, port_id: str, port_type: str) -> None:
         """Registers a new port (port_type: 'FAST' or 'STANDARD')."""
         self.ports[port_id] = Port(port_type,port_id)
-    def rebalance_load(self):
+    def rebalance_load(self,now = None):
         active = []
-        total_weighted_desired_kw = 0.0
-        total_desired_kw = 0.0
         for vehicle in self.vehicles.values():
             port = self.ports[vehicle.port_id]
-            if vehicle.is_fully_charged():
+            if vehicle.is_demand_met():
                 port.power = 0.0
-                port.state = "WAITING"
+                port.state = "IDLING"
                 continue
-                
-            effective_req  = min(vehicle.max_accept_rate_kw, port.port_maxpower_rate())
-            weight = self.tier_weights.get(vehicle.user_tier,1.0)
-            active.append((vehicle,port,effective_req,weight))
-            total_weighted_desired_kw += effective_req * weight
-            total_desired_kw += effective_req
-        if total_desired_kw> self.total_grid_cap:
-            for _,p,eff_req,w in active:
-                p.power = min(((eff_req * w)/total_weighted_desired_kw) * self.total_grid_cap,eff_req)
-                p.state = "CHARGING" if p.power >0 else "WAITING"
-        else:
-            for _,p,eff_req,_ in active:
-                p.power = eff_req
-                p.state = "CHARGING" if p.power > 0 else "WAITING"
+            max_kw = min(port.port_maxpower_rate(),vehicle.max_accept_rate_kw)
+            active.append((port.port_id,vehicle,max_kw))
+        rebalanced_powers = self.policy.allocate(active,self.total_grid_cap,now)
+        for port_id,_,_ in active:
+            port = self.ports[port_id]
+            port.power = rebalanced_powers.get(port_id,0.0)
+            port.state = "CHARGING" if port.power > 0.0 else "WAITING"
+
+
+
 
             
 
@@ -144,13 +187,21 @@ class ChargingStationManager:
             raise ValueError("capacity number is invalid")
         self.tick(timestamp)
         self.total_grid_cap = new_capacity_kw
-        self.rebalance_load()
+        self.rebalance_load(timestamp)
         
 
     def plug_in(self, timestamp: float, port_id: str, vehicle_id: str, 
                 battery_cap_kwh: float, current_kwh: float, max_rate_kw: float, 
-                user_tier: str) -> None:
+                user_tier: str,target_soc = None, departure_time = None, energy_requested_kwh = None) -> None:
         """Plugs a vehicle into a port."""
+        if target_soc is not None:
+            if target_soc <= 0 or target_soc > 1:
+                raise ValueError("target_soc must be between 0 and 1")
+            energy_requested_kwh = max(0,(battery_cap_kwh * target_soc) - current_kwh)
+        if energy_requested_kwh is not None and energy_requested_kwh < 0:
+            raise ValueError("energy_requested_kwh must be non-negative")
+        if departure_time is not None and departure_time <= timestamp:
+            raise ValueError("departure time must be after plugin time")
         if vehicle_id in self.vehicles:
             raise ValueError("Cannot plug twice")
         
@@ -159,14 +210,17 @@ class ChargingStationManager:
             if port.state != "UNPLUGGED":
                 raise ValueError("Port Already Occupied")
             self.tick(timestamp)
-            self.vehicles[vehicle_id] = Vehicle(vehicle_id,battery_cap_kwh,current_kwh,max_rate_kw,user_tier)
+            self.vehicles[vehicle_id] = Vehicle(vehicle_id,battery_cap_kwh,current_kwh,max_rate_kw,user_tier,departure_time,energy_requested_kwh)
+            vehicle = self.vehicles[vehicle_id]
+            if vehicle.is_demand_met():
+                vehicle.completed_timestamp = timestamp
             port.vehicle_id = vehicle_id
             port.state = "WAITING"
             self.vehicles[vehicle_id].port_id = port_id
             
         else:
             raise ValueError("Port Not Exist")
-        self.rebalance_load()
+        self.rebalance_load(timestamp)
 
     def unplug(self, timestamp: float, port_id: str) -> str:
         """Unplugs vehicle, frees port, and returns itemized bill string format: 
@@ -187,7 +241,7 @@ class ChargingStationManager:
         port.power = 0.0
         port.state = "UNPLUGGED"
         del self.vehicles[vehicle.vehicle_id]
-        self.rebalance_load()
+        self.rebalance_load(timestamp)
         return f"VEHICLE:{vehicle.vehicle_id}|ENERGY:{vehicle.total_energy_delivered:.2f}|COST:{total_cost:.2f}|IDLE_FEE:{idle_fee:.2f}"
         
 
@@ -202,7 +256,7 @@ class ChargingStationManager:
         log = []
         if self.last_timestamp is None:
             self.last_timestamp = timestamp
-            self.rebalance_load()
+            self.rebalance_load(timestamp)
             return log
         dt = timestamp - self.last_timestamp
         if dt < 0:
@@ -211,7 +265,7 @@ class ChargingStationManager:
             return log
         for vehicle in self.vehicles.values():
             port = self.ports[vehicle.port_id]
-            remaining = vehicle.remaining_capacity_kwh()
+            remaining = vehicle.remaining_demand_kwh()
             if port.state != "CHARGING" or port.power <= 0.0:
                 continue
             if remaining <= port.power * (dt/3600):
@@ -227,7 +281,7 @@ class ChargingStationManager:
                 vehicle.total_energy_cost += Billing_Engine.calculate_charging_cost(self.last_timestamp, timestamp, port.power, port.port_type)
                 vehicle.current_charge_kwh += energy
         old_states = {pid:p.state for pid,p in self.ports.items()}
-        self.rebalance_load()
+        self.rebalance_load(timestamp)
         for pid,p in self.ports.items():
             if p.state != old_states[pid]:
                 log.append(f"STATE_CHANGE:{pid}={p.state}")  
@@ -242,7 +296,7 @@ if __name__ == "__main__":
 
     m.plug_in(0, "P1", "V1", battery_cap_kwh=60, current_kwh=0, max_rate_kw=50, user_tier="REGULAR")
     print(m.tick(7200))
-    # ['CHARGING_COMPLETE:V1', 'STATE_CHANGE:P1=WAITING']
+    # ['CHARGING_COMPLETE:V1', 'STATE_CHANGE:P1=IDLING']
 
     print(m.unplug(9000, "P1"))
     # VEHICLE:V1|ENERGY:60.00|COST:27.00|IDLE_FEE:31.50
