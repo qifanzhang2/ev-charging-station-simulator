@@ -401,3 +401,32 @@ def test_manager_runs_with_llf_policy():
     assert m.ports["P2"].power == pytest.approx(50)   # B is more urgent
     assert m.ports["P1"].power == pytest.approx(0)
     assert m.ports["P1"].state == "WAITING"
+# ---------- next completion time ----------
+ 
+def test_next_completion_single_vehicle():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 100, 0, 50, "REGULAR", energy_requested_kwh=10)
+    # 10 kWh at 50 kW -> 0.2 h
+    assert m.next_completion_time() == pytest.approx(0.2 * HOUR)
+ 
+ 
+def test_next_completion_returns_earliest_vehicle():
+    m = make_station(100, n_ports=2)   # 100 kW so both get the full 50 kW
+    m.plug_in(0, "P1", "V1", 100, 0, 50, "REGULAR", energy_requested_kwh=10)
+    m.plug_in(0, "P2", "V2", 100, 0, 50, "REGULAR", energy_requested_kwh=50)
+    # V1: 0.2 h, V2: 1 h -> earliest is V1
+    assert m.next_completion_time() == pytest.approx(0.2 * HOUR)
+ 
+ 
+def test_next_completion_uses_allocated_power():
+    m = make_station(50, n_ports=2)    # grid short: each REGULAR car gets 25 kW
+    m.plug_in(0, "P1", "V1", 100, 0, 50, "REGULAR", energy_requested_kwh=10)
+    m.plug_in(0, "P2", "V2", 100, 0, 50, "REGULAR", energy_requested_kwh=50)
+    # V1: 10 kWh at 25 kW -> 0.4 h
+    assert m.next_completion_time() == pytest.approx(0.4 * HOUR)
+ 
+ 
+def test_next_completion_is_inf_when_nothing_charging():
+    m = make_station(100, n_ports=1)
+    m.plug_in(0, "P1", "V1", 100, 0, 50, "REGULAR", energy_requested_kwh=0)  # already satisfied -> IDLING
+    assert m.next_completion_time() == float("inf")
