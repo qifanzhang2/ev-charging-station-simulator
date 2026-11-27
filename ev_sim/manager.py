@@ -1,6 +1,7 @@
 from ev_sim.models import Port, Vehicle
 from ev_sim.billing import Billing_Engine
 from ev_sim.policies import WeightedProportionalPolicy
+from ev_sim.results import SessionResult
 class ChargingStationManager:
     def __init__(self, total_grid_capacity_kw: float,policy = None):
         self.total_grid_cap = total_grid_capacity_kw
@@ -8,7 +9,7 @@ class ChargingStationManager:
         self.vehicles = {}
         self.last_timestamp = None
         self.policy = policy if policy is not None else WeightedProportionalPolicy()
-        
+        self.records = []
         
 
 
@@ -86,6 +87,8 @@ class ChargingStationManager:
         vehicle = self.vehicles[port.vehicle_id]
         total_cost = Billing_Engine.calculate_discounted_energy_bill(vehicle)
         idle_fee = Billing_Engine.calculate_idlefee(vehicle,timestamp)
+        s = SessionResult(vehicle_id= vehicle.vehicle_id, requested_kwh= vehicle.remaining_demand_kwh()+ vehicle.total_energy_delivered, delivered_kwh= vehicle.total_energy_delivered)
+        self.records.append(s)
         port.vehicle_id = None
         port.power = 0.0
         port.state = "UNPLUGGED"
@@ -136,4 +139,19 @@ class ChargingStationManager:
                 log.append(f"STATE_CHANGE:{pid}={p.state}")  
         self.last_timestamp = timestamp
         return log
-         
+
+    def next_completion_time(self):
+        """Earliest time any charging vehicle will meet its demand at current power. 
+        Returns float('inf') if no vehicle is charging."""
+        min_finish_time = float("inf")
+        if self.last_timestamp is None:
+            return min_finish_time
+        for vehicle in self.vehicles.values():
+            port = self.ports[vehicle.port_id]
+            if port.state == "CHARGING":
+                remaining_kwh = vehicle.remaining_demand_kwh()
+                completion_time = self.last_timestamp + (remaining_kwh/port.power) * 3600
+                if completion_time < min_finish_time:
+                    min_finish_time = completion_time
+        return min_finish_time
+
