@@ -29,6 +29,12 @@ class Simulator:
     def run(self):
         self.manager.tick(0)
         while self.heap:
+            next_event_time = self.heap[0][0]
+            next_completion_time = self.manager.next_completion_time()
+            if self.manager.last_timestamp < next_completion_time < next_event_time:
+                self.manager.tick(next_completion_time)
+                continue
+            
             time, event_type, _,session= heapq.heappop(self.heap)
             if event_type == self.PLUG:
                 self.manager.plug_in(timestamp= time,

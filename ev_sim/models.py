@@ -35,4 +35,4 @@ class Vehicle:
         else:
             return self.remaining_capacity_kwh()
     def is_demand_met(self):
-        return self.remaining_demand_kwh() <= 1e-9
+        return self.remaining_demand_kwh() <= 1e-6
