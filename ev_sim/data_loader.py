@@ -2,7 +2,7 @@ from email.utils import parsedate_to_datetime
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from simulator import ChargingSession
+from ev_sim.simulator import ChargingSession
 def load_acn_sessions(path):
     all_sessions = []
     with open(path,"r") as f:
